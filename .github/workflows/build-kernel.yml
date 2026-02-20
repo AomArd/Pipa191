@@ -1,0 +1,251 @@
+name: Build Custom Kernel - Mi Pad 6 (pipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      SUBLEVEL:
+        description: 'Kernel SUBLEVEL (versi spoof)'
+        required: true
+        default: '191'
+        type: choice
+        options:
+          - '191'
+          - '157'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+      - name: Set up environment
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            g++-multilib gcc-multilib git gnupg gperf \
+            imagemagick lib32ncurses5-dev lib32readline-dev \
+            lib32z1-dev libelf-dev liblz4-tool libncurses5 \
+            libncurses5-dev libsdl1.2-dev libssl-dev \
+            libwxgtk3.0-gtk3-dev libxml2 libxml2-utils \
+            lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 python2 \
+            cpio kmod libelf-dev
+
+      - name: Clone Kernel Source (crDroid pipa branch)
+        run: |
+          git clone --depth=1 \
+            https://github.com/crdroidandroid/android_kernel_xiaomi_sm8250 \
+            -b 16.0-pipa \
+            kernel
+
+      - name: Download Clang Toolchain (AOSP Clang 17)
+        run: |
+          mkdir -p clang
+          # Download AOSP Clang 17 (r487747c) - sama dengan yang dipakai crDroid
+          wget -q https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r487747c.tar.gz -O clang.tar.gz || \
+          wget -q https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20230628-release/Clang-17.0.0-20230628.tar.gz -O clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          echo "CLANG_PATH=$(pwd)/clang/bin" >> $GITHUB_ENV
+
+      - name: Download GCC Cross Compiler (ARM64)
+        run: |
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9 \
+            -b lineage-19.1 \
+            gcc64
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9 \
+            -b lineage-19.1 \
+            gcc32
+          echo "GCC64_PATH=$(pwd)/gcc64/bin" >> $GITHUB_ENV
+          echo "GCC32_PATH=$(pwd)/gcc32/bin" >> $GITHUB_ENV
+
+      - name: Spoof Kernel SUBLEVEL ke ${{ github.event.inputs.SUBLEVEL }}
+        run: |
+          cd kernel
+          SUBLEVEL_TARGET=${{ github.event.inputs.SUBLEVEL }}
+          # Ubah SUBLEVEL di Makefile
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_TARGET}/" Makefile
+          # Verifikasi perubahan
+          echo "=== Verifikasi Makefile ==="
+          grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" Makefile
+
+      - name: Set Build Variables
+        run: |
+          echo "ARCH=arm64" >> $GITHUB_ENV
+          echo "SUBARCH=arm64" >> $GITHUB_ENV
+          echo "DEFCONFIG=vendor/pipa_defconfig" >> $GITHUB_ENV
+          echo "KERNEL_DIR=$(pwd)/kernel" >> $GITHUB_ENV
+          echo "OUT_DIR=$(pwd)/out" >> $GITHUB_ENV
+          
+          # Export PATH
+          echo "PATH=$(pwd)/clang/bin:$(pwd)/gcc64/bin:$(pwd)/gcc32/bin:$PATH" >> $GITHUB_ENV
+          
+          # Cross compile flags
+          echo "CROSS_COMPILE=aarch64-linux-android-" >> $GITHUB_ENV
+          echo "CROSS_COMPILE_ARM32=arm-linux-androideabi-" >> $GITHUB_ENV
+          echo "CC=clang" >> $GITHUB_ENV
+          echo "CLANG_TRIPLE=aarch64-linux-gnu-" >> $GITHUB_ENV
+
+      - name: Check defconfig availability
+        run: |
+          cd kernel
+          echo "=== Available pipa defconfigs ==="
+          find arch/arm64/configs -name "*pipa*" -o -name "*sm8250*" 2>/dev/null
+          ls arch/arm64/configs/ | grep -E "pipa|kona|sm8250" || echo "Mencari defconfig alternatif..."
+
+      - name: Generate .config
+        run: |
+          cd kernel
+          mkdir -p ${{ env.OUT_DIR }}
+          
+          # Coba pipa_defconfig dulu, fallback ke vendor/kona_defconfig
+          if [ -f "arch/arm64/configs/vendor/pipa_defconfig" ]; then
+            DEFCONFIG="vendor/pipa_defconfig"
+          elif [ -f "arch/arm64/configs/pipa_defconfig" ]; then
+            DEFCONFIG="pipa_defconfig"
+          elif [ -f "arch/arm64/configs/vendor/kona_defconfig" ]; then
+            DEFCONFIG="vendor/kona_defconfig"
+          else
+            # Cari defconfig yang ada
+            DEFCONFIG=$(ls arch/arm64/configs/ | grep -E "pipa|kona" | head -1)
+          fi
+          
+          echo "Menggunakan defconfig: $DEFCONFIG"
+          echo "DEFCONFIG_USED=$DEFCONFIG" >> $GITHUB_ENV
+          
+          make O=${{ env.OUT_DIR }} \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            ${DEFCONFIG}
+
+      - name: Build Kernel
+        run: |
+          cd kernel
+          
+          make -j$(nproc --all) \
+            O=${{ env.OUT_DIR }} \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-android- \
+            CROSS_COMPILE_ARM32=arm-linux-androideabi- \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            2>&1 | tee ../build.log
+
+      - name: Check Build Result
+        run: |
+          if [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "✅ Build BERHASIL! Image.gz-dtb ditemukan"
+          elif [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz" ]; then
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "✅ Build BERHASIL! Image.gz ditemukan"
+          elif [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image" ]; then
+            echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "✅ Build BERHASIL! Image ditemukan"
+          else
+            echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
+            echo "❌ Build GAGAL! Tidak ada kernel image"
+            exit 1
+          fi
+
+      - name: Clone AnyKernel3 untuk packaging
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3 \
+            AnyKernel3
+
+      - name: Package Kernel dengan AnyKernel3
+        if: env.BUILD_SUCCESS == 'true'
+        run: |
+          cd AnyKernel3
+          
+          # Copy kernel image
+          if [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp ${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz-dtb .
+          elif [ -f "${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz" ]; then
+            cp ${{ env.OUT_DIR }}/arch/arm64/boot/Image.gz .
+          else
+            cp ${{ env.OUT_DIR }}/arch/arm64/boot/Image .
+          fi
+          
+          # Copy DTBs jika ada
+          if [ -d "${{ env.OUT_DIR }}/arch/arm64/boot/dts" ]; then
+            find ${{ env.OUT_DIR }}/arch/arm64/boot/dts -name "*.dtb" -exec cp {} . \; 2>/dev/null || true
+          fi
+          
+          # Edit anykernel.sh untuk pipa
+          cat > anykernel.sh << 'AKSH'
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+## AnyKernel setup
+# begin properties
+properties() { '
+kernel.string=Custom Kernel for Mi Pad 6 (pipa) - Spoofed Version
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=pipa
+supported.versions=
+supported.patchlevels=
+'; } # end properties
+
+## AnyKernel methods (DO NOT CHANGE)
+. tools/ak3-core.sh
+
+## AnyKernel file attributes
+set_perm_recursive 0 0 755 644 $ramdisk/*
+set_perm_recursive 0 0 750 750 $ramdisk/init* $ramdisk/sbin
+
+## AnyKernel install
+split_boot
+flash_boot
+AKSH
+          
+          # Package ke ZIP
+          SUBLEVEL=${{ github.event.inputs.SUBLEVEL }}
+          DATE=$(date +%Y%m%d)
+          ZIP_NAME="CustomKernel-pipa-4.19.${SUBLEVEL}-crDroid16-${DATE}.zip"
+          
+          zip -r9 ../${ZIP_NAME} . -x '*.git*' '*patch*' '*ramdisk*' 'LICENSE' 'README.md'
+          echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "✅ Package berhasil: ${ZIP_NAME}"
+
+      - name: Upload Kernel ZIP sebagai Artifact
+        if: env.BUILD_SUCCESS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: CustomKernel-pipa-4.19.${{ github.event.inputs.SUBLEVEL }}
+          path: |
+            ${{ env.ZIP_NAME }}
+            build.log
+          retention-days: 7
+
+      - name: Upload build log (jika gagal)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-error
+          path: build.log
+          retention-days: 3
+
+      - name: Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Device:** Mi Pad 6 (pipa)" >> $GITHUB_STEP_SUMMARY
+          echo "- **ROM Base:** crDroid 12.5 Android 16" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel Source:** crdroidandroid/android_kernel_xiaomi_sm8250 branch 16.0-pipa" >> $GITHUB_STEP_SUMMARY
+          echo "- **Kernel Version Spoofed:** 4.19.${{ github.event.inputs.SUBLEVEL }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status:** ${{ env.BUILD_SUCCESS == 'true' && '✅ BERHASIL' || '❌ GAGAL' }}" >> $GITHUB_STEP_SUMMARY
+          
