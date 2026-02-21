@@ -40,6 +40,8 @@ jobs:
           mkdir -p clang
           wget -q "https://github.com/ZyCromerZ/Clang/releases/download/17.0.0-20230628-release/Clang-17.0.0-20230628.tar.gz" -O clang.tar.gz
           tar -xzf clang.tar.gz -C clang
+          echo "Clang version:"
+          clang/bin/clang --version
 
       - name: Download GCC Toolchain
         run: |
@@ -53,35 +55,37 @@ jobs:
       - name: Spoof Kernel SUBLEVEL
         run: |
           cd kernel
-          SUBLEVEL_TARGET=${{ github.event.inputs.SUBLEVEL }}
-          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${SUBLEVEL_TARGET}/" Makefile
-          echo "=== Verifikasi ==="
-          grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL" Makefile
+          sed -i "s/^SUBLEVEL = .*/SUBLEVEL = ${{ github.event.inputs.SUBLEVEL }}/" Makefile
+          echo "=== Verifikasi Makefile ==="
+          grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL\|^EXTRAVERSION" Makefile
 
-      - name: Find defconfig
+      - name: Find and set defconfig
         run: |
           cd kernel
-          echo "=== Mencari defconfig pipa ==="
-          find arch/arm64/configs -name "*pipa*" 2>/dev/null || true
-          find arch/arm64/configs -name "*kona*" 2>/dev/null || true
+          echo "=== Semua defconfig tersedia ==="
+          find arch/arm64/configs -name "*.defconfig" -o -name "*defconfig" 2>/dev/null | sort
 
+          # Prioritas: pipa > kona > sm8250
           if [ -f "arch/arm64/configs/vendor/pipa_defconfig" ]; then
-            echo "DEFCONFIG=vendor/pipa_defconfig" >> $GITHUB_ENV
+            DEFCONFIG="vendor/pipa_defconfig"
           elif [ -f "arch/arm64/configs/pipa_defconfig" ]; then
-            echo "DEFCONFIG=pipa_defconfig" >> $GITHUB_ENV
+            DEFCONFIG="pipa_defconfig"
           elif [ -f "arch/arm64/configs/vendor/kona_defconfig" ]; then
-            echo "DEFCONFIG=vendor/kona_defconfig" >> $GITHUB_ENV
+            DEFCONFIG="vendor/kona_defconfig"
+          elif [ -f "arch/arm64/configs/kona_defconfig" ]; then
+            DEFCONFIG="kona_defconfig"
           else
-            FOUND=$(find arch/arm64/configs -name "*.defconfig" | head -1)
-            echo "DEFCONFIG=$(basename $FOUND .defconfig)" >> $GITHUB_ENV
+            DEFCONFIG=$(find arch/arm64/configs -maxdepth 2 -name "*defconfig" | head -1 | sed 's|arch/arm64/configs/||')
           fi
+
+          echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
+          echo "Defconfig yang akan digunakan: $DEFCONFIG"
 
       - name: Generate .config
         run: |
           export PATH=$(pwd)/clang/bin:$(pwd)/gcc64/bin:$(pwd)/gcc32/bin:$PATH
           cd kernel
           mkdir -p ../out
-          echo "Menggunakan defconfig: ${{ env.DEFCONFIG }}"
           make O=../out \
             ARCH=arm64 \
             SUBARCH=arm64 \
@@ -97,6 +101,7 @@ jobs:
         run: |
           export PATH=$(pwd)/clang/bin:$(pwd)/gcc64/bin:$(pwd)/gcc32/bin:$PATH
           cd kernel
+          set -o pipefail
           make -j$(nproc --all) \
             O=../out \
             ARCH=arm64 \
@@ -109,20 +114,36 @@ jobs:
             LLVM_IAS=1 \
             2>&1 | tee ../build.log
 
+      - name: Show last 100 lines of build log
+        if: always()
+        run: |
+          echo "=== 100 BARIS TERAKHIR BUILD LOG ==="
+          tail -100 build.log || true
+
+      - name: Show errors from build log
+        if: always()
+        run: |
+          echo "=== SEMUA ERROR YANG DITEMUKAN ==="
+          grep -n "error:\|Error\|undefined\|ld:" build.log | tail -50 || echo "Tidak ada error ditemukan di log"
+
       - name: Check Build Result
         run: |
           if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "Kernel image: Image.gz-dtb"
           elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "Kernel image: Image.gz"
           elif [ -f "out/arch/arm64/boot/Image" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
+            echo "Kernel image: Image"
           else
             echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
             echo "Build GAGAL - tidak ada kernel image"
+            ls out/arch/arm64/boot/ 2>/dev/null || echo "Folder boot tidak ada"
             exit 1
           fi
 
@@ -139,12 +160,12 @@ jobs:
             find out/arch/arm64/boot/dts -name "*.dtb" -exec cp {} AnyKernel3/ \; 2>/dev/null || true
           fi
           cd AnyKernel3
-          SUBLEVEL=${{ github.event.inputs.SUBLEVEL }}
           DATE=$(date +%Y%m%d)
-          ZIP_NAME="CustomKernel-pipa-4.19.${SUBLEVEL}-crDroid16-${DATE}.zip"
+          ZIP_NAME="CustomKernel-pipa-4.19.${{ github.event.inputs.SUBLEVEL }}-crDroid16-${DATE}.zip"
           sed -i 's/do.devicecheck=1/do.devicecheck=0/' anykernel.sh
           zip -r9 ../${ZIP_NAME} . -x "*.git*"
           echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+          echo "Berhasil membuat: ${ZIP_NAME}"
 
       - name: Upload Kernel ZIP
         if: env.BUILD_SUCCESS == 'true'
@@ -156,19 +177,11 @@ jobs:
             build.log
           retention-days: 7
 
-      - name: Upload build log jika gagal
-        if: failure()
+      - name: Upload build log
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log-error
+          name: build-log
           path: build.log
           retention-days: 3
-
-      - name: Summary
-        if: always()
-        run: |
-          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Device:** Mi Pad 6 (pipa)" >> $GITHUB_STEP_SUMMARY
-          echo "- **ROM Base:** crDroid 12.5 Android 16" >> $GITHUB_STEP_SUMMARY
-          echo "- **Kernel Version Spoofed:** 4.19.${{ github.event.inputs.SUBLEVEL }}" >> $GITHUB_STEP_SUMMARY
           
