@@ -59,13 +59,32 @@ jobs:
           echo "=== Verifikasi Makefile ==="
           grep "^VERSION\|^PATCHLEVEL\|^SUBLEVEL\|^EXTRAVERSION" Makefile
 
+      - name: Disable KernelSU dari source (fix sucompat.c error)
+        run: |
+          cd kernel
+          # Disable KernelSU di Kconfig/Makefile agar tidak ikut compile
+          # Cara 1: hapus/disable di drivers/kernelsu/Makefile
+          if [ -f "drivers/kernelsu/Makefile" ]; then
+            echo "# Disabled" > drivers/kernelsu/Makefile
+            echo "KernelSU Makefile di-disable"
+          fi
+
+          # Cara 2: disable di drivers/Makefile atau Kconfig
+          if [ -f "drivers/Makefile" ]; then
+            sed -i 's/.*kernelsu.*/# &/' drivers/Makefile
+            echo "KernelSU entry di drivers/Makefile di-disable"
+          fi
+
+          # Cara 3: pastikan CONFIG_KSU tidak aktif
+          echo "=== Cek referensi KernelSU ==="
+          grep -r "kernelsu\|KSU\|KernelSU" drivers/Makefile 2>/dev/null || true
+
       - name: Find and set defconfig
         run: |
           cd kernel
           echo "=== Semua defconfig tersedia ==="
-          find arch/arm64/configs -name "*.defconfig" -o -name "*defconfig" 2>/dev/null | sort
+          find arch/arm64/configs -name "*defconfig" 2>/dev/null | sort
 
-          # Prioritas: pipa > kona > sm8250
           if [ -f "arch/arm64/configs/vendor/pipa_defconfig" ]; then
             DEFCONFIG="vendor/pipa_defconfig"
           elif [ -f "arch/arm64/configs/pipa_defconfig" ]; then
@@ -79,7 +98,7 @@ jobs:
           fi
 
           echo "DEFCONFIG=$DEFCONFIG" >> $GITHUB_ENV
-          echo "Defconfig yang akan digunakan: $DEFCONFIG"
+          echo "Defconfig yang digunakan: $DEFCONFIG"
 
       - name: Generate .config
         run: |
@@ -96,6 +115,14 @@ jobs:
             LLVM=1 \
             LLVM_IAS=1 \
             ${{ env.DEFCONFIG }}
+
+          # Disable KSU di .config juga
+          cd ../out
+          if grep -q "CONFIG_KSU" .config 2>/dev/null; then
+            sed -i 's/CONFIG_KSU=y/# CONFIG_KSU is not set/' .config
+            sed -i 's/CONFIG_KERNELSU=y/# CONFIG_KERNELSU is not set/' .config
+            echo "CONFIG_KSU disabled di .config"
+          fi
 
       - name: Build Kernel
         run: |
@@ -114,35 +141,29 @@ jobs:
             LLVM_IAS=1 \
             2>&1 | tee ../build.log
 
-      - name: Show last 100 lines of build log
-        if: always()
-        run: |
-          echo "=== 100 BARIS TERAKHIR BUILD LOG ==="
-          tail -100 build.log || true
-
       - name: Show errors from build log
         if: always()
         run: |
-          echo "=== SEMUA ERROR YANG DITEMUKAN ==="
-          grep -n "error:\|Error\|undefined\|ld:" build.log | tail -50 || echo "Tidak ada error ditemukan di log"
+          echo "=== ERROR YANG DITEMUKAN ==="
+          grep -n "error:\|fatal:" build.log | head -30 || echo "Tidak ada error"
 
       - name: Check Build Result
         run: |
           if [ -f "out/arch/arm64/boot/Image.gz-dtb" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz-dtb" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
-            echo "Kernel image: Image.gz-dtb"
+            echo "SUCCESS: Image.gz-dtb"
           elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image.gz" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
-            echo "Kernel image: Image.gz"
+            echo "SUCCESS: Image.gz"
           elif [ -f "out/arch/arm64/boot/Image" ]; then
             echo "KERNEL_IMAGE=out/arch/arm64/boot/Image" >> $GITHUB_ENV
             echo "BUILD_SUCCESS=true" >> $GITHUB_ENV
-            echo "Kernel image: Image"
+            echo "SUCCESS: Image"
           else
             echo "BUILD_SUCCESS=false" >> $GITHUB_ENV
-            echo "Build GAGAL - tidak ada kernel image"
+            echo "GAGAL - tidak ada kernel image"
             ls out/arch/arm64/boot/ 2>/dev/null || echo "Folder boot tidak ada"
             exit 1
           fi
